@@ -1,0 +1,117 @@
+name: Device Auth Broker
+
+on:
+  repository_dispatch:
+    types: [device_auth_init]
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Initiate Device Flow
+        id: device
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}  # OAuth App ID
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}  # OAuth App Secret
+        run: |
+          # Request device code from GitHub
+          RESPONSE=$(curl -s -X POST https://github.com/login/device/code \
+            -H "Accept: application/json" \
+            -d "client_id=$CLIENT_ID" \
+            -d "scope=public_repo")
+
+          echo "device_response=$RESPONSE" >> $GITHUB_OUTPUT
+          echo "$RESPONSE" | jq -r '.user_code' > user_code.txt
+          echo "$RESPONSE" | jq -r '.device_code' > device_code.txt
+          echo "$RESPONSE" | jq -r '.interval // 5' > interval.txt
+
+      - name: Write user code to data store (for client to read)
+        env:
+          USER_CODE: ${{ fromJSON(steps.device.outputs.device_response).user_code }}
+          CORR_ID: ${{ github.event.client_payload.correlation_id }}
+          APP_REPO: ${{ secrets.APP_REPO }}  # e.g., "username/todo-store"
+          TOKEN: ${{ secrets.APP_REPO_TOKEN }}  # PAT with write access to DATA repo
+        run: |
+          # Create temporary file in DATA repo so client can see the user_code
+          curl -X PUT "https://api.github.com/repos/$APP_REPO/contents/.auth/$CORR_ID.json" \
+            -H "Authorization: token $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"message\": \"Auth step 1 for $CORR_ID\",
+              \"content\": \"$(echo '{\"user_code\":\"'$USER_CODE'\",\"status\":\"pending\"}' | base64 -w 0)\"
+            }"
+
+      - name: Poll for authorization (server-side)
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          DEVICE_CODE: ${{ fromJSON(steps.device.outputs.device_response).device_code }}
+          INTERVAL: ${{ fromJSON(steps.device.outputs.device_response).interval || 5 }}
+          CORR_ID: ${{ github.event.client_payload.correlation_id }}
+          APP_REPO: ${{ secrets.APP_REPO }}
+          TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+          SYM_KEY: ${{ github.event.client_payload.symmetric_key }}
+        run: |
+          MAX_TRIES=300
+          INTERVAL=${INTERVAL:-5}
+
+          for i in $(seq 1 $MAX_TRIES); do
+            sleep $INTERVAL
+
+            TOKEN_RESPONSE=$(curl -s -X POST https://github.com/login/oauth/access_token \
+              -H "Accept: application/json" \
+              -d "client_id=$CLIENT_ID" \
+              -d "client_secret=$CLIENT_SECRET" \
+              -d "device_code=$DEVICE_CODE" \
+              -d "grant_type=urn:ietf:params:oauth:grant-type:device_code")
+
+            ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
+            ERROR=$(echo "$TOKEN_RESPONSE" | jq -r '.error // empty')
+
+            if [ -n "$ACCESS_TOKEN" ] && [ "$ACCESS_TOKEN" != "null" ]; then
+              # Encrypt token with client's symmetric key
+              ENCRYPTED=$(node -e "
+                const crypto = require('crypto');
+                const key = Buffer.from('$SYM_KEY'.replace(/-/g,'+').replace(/_/g,'/'), 'base64');
+                const iv = crypto.randomBytes(12);
+                const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+                let ct = cipher.update('$ACCESS_TOKEN', 'utf8', 'base64url');
+                ct += cipher.final('base64url');
+                const tag = cipher.getAuthTag();
+                console.log(JSON.stringify({
+                  iv: iv.toString('base64url'),
+                  ct: ct,
+                  tag: tag.toString('base64url'),
+                  status: 'complete'
+                }));
+              ")
+
+              # Update file in data repo with encrypted token
+              # Get current SHA first
+              SHA=$(curl -s "https://api.github.com/repos/$APP_REPO/contents/.auth/$CORR_ID.json" \
+                -H "Authorization: token $TOKEN" | jq -r '.sha // empty')
+
+              curl -X PUT "https://api.github.com/repos/$APP_REPO/contents/.auth/$CORR_ID.json" \
+                -H "Authorization: token $TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"message\": \"Token for $CORR_ID\",
+                  \"content\": \"$(echo \"$ENCRYPTED\" | base64 -w 0)\",
+                  \"sha\": \"$SHA\"
+                }"
+              exit 0
+            fi
+
+            if [ "$ERROR" = "access_denied" ] || [ "$ERROR" = "expired_token" ]; then
+              echo "Auth failed: $ERROR"
+              exit 1
+            fi
+
+            # Slow down if requested
+            if [ "$ERROR" = "slow_down" ]; then
+              INTERVAL=$((INTERVAL + 5))
+            fi
+          done
+
+          echo "Timeout"
+          exit 1
